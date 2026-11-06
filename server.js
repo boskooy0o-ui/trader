@@ -1,76 +1,97 @@
-const http = require("http");
-const fs = require("fs");
-const path = require("path");
-const crypto = require("crypto");
+const express = require('express');
+const http = require('http');
+const WebSocket = require('ws');
+const cors = require('cors');
+const Indicators = require('./indicators');
 
-const OLLAMA = process.env.OLLAMA_URL || "http://127.0.0.1:11434";
-const PORT = 8765;
-const queue = [];
-const waiters = [];
-const pending = new Map();
-let seen = 0;
+const app = express();
+app.use(cors());
+app.use(express.json());
 
-const send = (res, code, body, type = "application/json") => {
-  const data = Buffer.isBuffer(body) ? body : Buffer.from(typeof body === "string" ? body : JSON.stringify(body));
-  res.writeHead(code, { "Content-Type": type, "Content-Length": data.length });
-  res.end(data);
-};
-const readBody = req => new Promise(r => {
-  let s = "";
-  req.on("data", c => (s += c));
-  req.on("end", () => { try { r(JSON.parse(s || "{}")); } catch { r({}); } });
+const server = http.createServer(app);
+const wss = new WebSocket.Server({ server });
+
+const symbols = ['BTC', 'ETH', 'SOL', 'BNB'];
+const indicators = {};
+const prices = { BTC: 68000, ETH: 3500, SOL: 180, BNB: 600 };
+
+// Initialize an isolated Indicators engine instance for each coin
+symbols.forEach(sym => {
+  indicators[sym] = new Indicators(sym, 10000);
 });
-const ollama = async (res, url, opts) => {
-  try {
-    const r = await fetch(OLLAMA + url, opts);
-    send(res, 200, Buffer.from(await r.arrayBuffer()));
-  } catch (e) {
-    send(res, 502, { error: String(e.message || e) });
-  }
-};
-const nextCmd = () => new Promise(resolve => {
-  if (queue.length) return resolve(queue.shift());
-  const w = { resolve };
-  w.timer = setTimeout(() => {
-    waiters.splice(waiters.indexOf(w), 1);
-    resolve({});
-  }, 8000);
-  waiters.push(w);
-});
-const enqueue = cmd => {
-  const w = waiters.shift();
-  if (w) { clearTimeout(w.timer); w.resolve(cmd); } else queue.push(cmd);
-};
 
-http.createServer(async (req, res) => {
-  const u = req.url;
-  if (req.method === "GET") {
-    if (u === "/" || u === "/index.html")
-      return send(res, 200, fs.readFileSync(path.join(__dirname, "index.html")), "text/html; charset=utf-8");
-    if (u === "/api/tags") return ollama(res, "/api/tags");
-    if (u === "/api/status") return send(res, 200, { plugin: Date.now() - seen < 20000 });
-    if (u === "/plugin/poll") { seen = Date.now(); return send(res, 200, await nextCmd()); }
-    return send(res, 404, {});
-  }
-  const b = await readBody(req);
-  if (u === "/api/chat")
-    return ollama(res, "/api/chat", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(b) });
-  if (u === "/api/cmd") {
-    b.id = crypto.randomUUID().replace(/-/g, "");
-    const result = await new Promise(resolve => {
-      const timer = setTimeout(() => {
-        pending.delete(b.id);
-        resolve({ ok: false, output: "plugin timeout" });
-      }, ((b.seconds || 0) + 40) * 1000);
-      pending.set(b.id, r => { clearTimeout(timer); resolve(r); });
-      enqueue(b);
-    });
-    return send(res, 200, result);
-  }
-  if (u === "/plugin/result") {
-    const done = pending.get(b.id);
-    if (done) { pending.delete(b.id); done(b); }
-    return send(res, 200, {});
-  }
-  send(res, 404, {});
-}).listen(PORT, "127.0.0.1", () => console.log(`Ollama Studio: http://localhost:${PORT}`));
+// Uptime keep-alive endpoint for cloud hosting (Render)
+app.get('/ping', (req, res) => {
+  res.send('OK');
+});
+
+// REST API endpoint for system status check
+app.get('/api/status', (req, res) => {
+  const status = {};
+  symbols.forEach(sym => {
+    status[sym] = indicators[sym].update();
+  });
+  res.json(status);
+});
+
+// WebSocket Connection Management
+wss.on('connection', (ws) => {
+  console.log('Mobile client connected via WebSocket.');
+
+  ws.on('message', (msgStr) => {
+    try {
+      const msg = JSON.parse(msgStr);
+      // Allows changing settings (leverage, autoTrade, etc.) over WebSocket
+      if (msg.type === 'UPDATE_CONFIG' && msg.symbol && indicators[msg.symbol]) {
+        Object.assign(indicators[msg.symbol].tradingState, msg.config);
+      }
+    } catch (e) {
+      console.error('WebSocket message parsing error:', e.message);
+    }
+  });
+
+  // Broadcast initial full snapshot on connection
+  const snapshot = {};
+  symbols.forEach(sym => {
+    snapshot[sym] = indicators[sym].update();
+  });
+  ws.send(JSON.stringify({ type: 'SNAPSHOT', data: snapshot }));
+});
+
+// 1-Second Tick Loop (Generates realistic 1m OHLCV candles)
+setInterval(() => {
+  const updates = {};
+
+  symbols.forEach(sym => {
+    // Geometric Brownian motion tick simulation
+    const volatility = 0.0012;
+    const changePct = (Math.random() - 0.495) * volatility;
+    prices[sym] = Number((prices[sym] * (1 + changePct)).toFixed(2));
+
+    const currentPrice = prices[sym];
+    const candle = {
+      open: currentPrice,
+      high: Number((currentPrice * 1.0005).toFixed(2)),
+      low: Number((currentPrice * 0.9995).toFixed(2)),
+      close: currentPrice,
+      volume: Number((Math.random() * 50).toFixed(2))
+    };
+
+    indicators[sym].addCandle(candle);
+    updates[sym] = indicators[sym].update();
+  });
+
+  // Broadcast market and strategy state to all connected clients
+  const payload = JSON.stringify({ type: 'TICK', data: updates });
+  wss.clients.forEach((client) => {
+    if (client.readyState === WebSocket.OPEN) {
+      client.send(payload);
+    }
+  });
+}, 1000);
+
+// Bind to PORT provided by host environment or fallback to 3000
+const PORT = process.env.PORT || 3000;
+server.listen(PORT, '0.0.0.0', () => {
+  console.log(`24/7 SuperTrend Trading Engine running on port ${PORT}`);
+});
